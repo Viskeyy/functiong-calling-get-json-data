@@ -1,11 +1,6 @@
-import * as http from "http";
-import * as https from "https";
-
 export const description = "Fetch JSON from a URL.";
 
-const MAX_RESPONSE_BYTES = 2_000_000;
-const MAX_RETURN_TOKENS = 32_000;
-const MAX_ARRAY_ITEMS = 100;
+const MAX_ARRAY_ITEMS = 50;
 
 /**
  * Accepted arguments for the handler function.
@@ -38,24 +33,6 @@ function getByPath(obj: any, path: string): any {
 	return cur;
 }
 
-function pickFields(data: any, path?: string): any {
-	if (!path) return data;
-	return getByPath(data, path);
-}
-
-function estimateBytes(value: any): number {
-	if (typeof value === "string") return Buffer.byteLength(value, "utf8");
-	try {
-		return Buffer.byteLength(JSON.stringify(value), "utf8");
-	} catch {
-		return 0;
-	}
-}
-function estimateTokens(value: any): number {
-	const bytes = estimateBytes(value);
-	return Math.max(1, Math.ceil(bytes / 4));
-}
-
 function truncateArrays(value: any, maxItems: number): any {
 	if (Array.isArray(value)) {
 		if (value.length <= maxItems) return value.map((v) => truncateArrays(v, maxItems));
@@ -69,79 +46,55 @@ function truncateArrays(value: any, maxItems: number): any {
 	return value;
 }
 
-async function fetchJson(
-	url: string,
-	opts: { timeoutMs?: number; maxResponseSize?: number; headers?: Record<string, string> } = {},
-): Promise<any> {
-	const { timeoutMs = 5000, maxResponseSize = MAX_RESPONSE_BYTES, headers = {} } = opts;
-	let parsed: URL;
+async function fetchJson(url: string, opts: { timeoutMs?: number } = {}): Promise<any> {
+	const { timeoutMs = 5000 } = opts;
+
 	try {
-		parsed = new URL(url);
+		new URL(url);
 	} catch {
 		throw new Error(`Invalid URL: ${url}`);
 	}
-	const httpMod = parsed.protocol === "https:" ? https : http;
 
-	return new Promise<any>((resolve, reject) => {
-		const req = httpMod.request(
-			parsed,
-			{ method: "GET", headers: { Accept: "application/json", "User-Agent": "function-calling", ...headers } },
-			(res) => {
-				if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-					let errBody = "";
-					res.on("data", (c) => {
-						errBody += c.toString("utf8");
-						if (errBody.length > 1000) errBody = errBody.slice(0, 1000) + "...";
-					});
-					res.on("end", () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
-					return;
-				}
-				let raw = "";
-				let size = 0;
-				res.setEncoding("utf8");
-				res.on("data", (chunk: string) => {
-					size += Buffer.byteLength(chunk, "utf8");
-					if (size > maxResponseSize) {
-						req.destroy(new Error(`Response larger than ${maxResponseSize} bytes`));
-						return;
-					}
-					raw += chunk;
-				});
-				res.on("end", () => {
-					if (!raw) return resolve(null);
-					try {
-						return resolve(JSON.parse(raw));
-					} catch (e) {
-						return reject(new Error("Failed to parse JSON: " + (e as Error).message));
-					}
-				});
-			},
-		);
-		req.on("error", (e) => reject(new Error("Request error: " + String(e))));
-		req.setTimeout(timeoutMs, () => req.destroy(new Error(`Request timed out after ${timeoutMs}ms`)));
-		req.end();
-	});
-}
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-async function callAndPick(options: {
-	url: string;
-	path?: string;
-	timeoutMs?: number;
-	maxResponseSize?: number;
-	headers?: Record<string, string>;
-}): Promise<any> {
-	if (!options?.url || typeof options.url !== "string") throw new Error("options.url required");
-	const json = await fetchJson(options.url, {
-		timeoutMs: options.timeoutMs,
-		maxResponseSize: options.maxResponseSize,
-		headers: options.headers,
-	});
-	return pickFields(json, options.path);
+	try {
+		const res = await fetch(url, {
+			method: "GET",
+			headers: { Accept: "application/json", "User-Agent": "function-calling" },
+			signal: controller.signal,
+		});
+
+		if (!res.ok) {
+			let errBody = "";
+			try {
+				errBody = await res.text();
+			} catch {
+				errBody = "";
+			}
+			if (errBody.length > 1000) errBody = errBody.slice(0, 1000) + "...";
+			throw new Error(`HTTP ${res.status}: ${errBody}`);
+		}
+
+		const raw = await res.text();
+		if (!raw) return null;
+
+		try {
+			return JSON.parse(raw);
+		} catch (e) {
+			throw new Error("Failed to parse JSON: " + (e as Error).message);
+		}
+	} catch (e: any) {
+		if (e?.name === "AbortError") {
+			throw new Error(`Request timed out after ${timeoutMs}ms`);
+		}
+		throw e;
+	} finally {
+		clearTimeout(timeoutId);
+	}
 }
 
 export async function handler(args: Argument) {
-	console.log(args, "args");
-
 	try {
 		const url = args?.url ?? process.env.FETCH_URL;
 		console.log(`> trigger: [${url ?? "no-url-provided"}]`);
@@ -166,41 +119,24 @@ export async function handler(args: Argument) {
 		const urlWithTs = parsedUrl.toString();
 
 		console.log(`  [url=${url}] Fetching JSON...`);
-		const data = await callAndPick({
-			url: urlWithTs,
-			path: args?.info,
+		const data = await fetchJson(urlWithTs, {
 			timeoutMs: 8000,
-			maxResponseSize: MAX_RESPONSE_BYTES,
 		});
-		console.log(`  [url=${url}] Fetched data; evaluating size and info.`);
+		console.log(`  [url=${url}] Fetched data.`);
 
-		const tokens = estimateTokens(data);
-		if (tokens > MAX_RETURN_TOKENS) {
-			console.warn(`  [url=${url}] Data too large (~${tokens} tokens).`);
-			if (!args?.info) {
-				return {
-					ok: false,
-					result: `Result too large (~${tokens} tokens). Provide 'info' to reduce size or increase MAX_RETURN_TOKENS.`,
-				};
-			}
-			const truncated = truncateArrays(data, MAX_ARRAY_ITEMS);
-			const truncatedTokens = estimateTokens(truncated);
-			if (truncatedTokens > MAX_RETURN_TOKENS) {
-				return {
-					ok: false,
-					result: `Result still too large after truncation (~${truncatedTokens} tokens). Narrow 'info' or increase MAX_RETURN_TOKENS.`,
-				};
-			}
-			return {
-				ok: true,
-				result: truncated,
-			};
+		// Extract data using info path if provided
+		let result = data;
+		if (args?.info) {
+			result = getByPath(data, args.info);
+			console.log(`  [url=${url}] Extracted path: ${args.info}`);
 		}
 
-		console.log(`  [url=${url}] Returning result (${tokens} tokens approx).`);
+		// Truncate arrays to MAX_ARRAY_ITEMS
+		const truncated = truncateArrays(result, MAX_ARRAY_ITEMS);
+
 		return {
 			ok: true,
-			result: data,
+			result: truncated,
 		};
 	} catch (error) {
 		console.error("> handler failed:", error);

@@ -40,3 +40,4 @@ test-results.xml
 
 # YoMo specific
 .wrapper.ts
+yc.yml
