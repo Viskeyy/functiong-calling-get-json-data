@@ -46,6 +46,39 @@ function truncateArrays(value: any, maxItems: number): any {
 	return value;
 }
 
+async function getLatestJsonUrl(url: string): Promise<string> {
+	try {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Referer: "https://aicon.infoq.cn",
+				Accept: "application/json",
+				"User-Agent": "function-calling",
+			},
+			body: JSON.stringify({
+				location_en: "beijing",
+				time: 202512,
+				category: 1,
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(`HTTP ${response.status}: Failed to fetch latest JSON URL`);
+		}
+
+		const res = await response.json();
+
+		if (!res?.data?.json) {
+			throw new Error("Invalid response structure: missing data.json");
+		}
+
+		return res.data.json;
+	} catch (error) {
+		throw error;
+	}
+}
+
 async function fetchJson(url: string, opts: { timeoutMs?: number } = {}): Promise<any> {
 	const { timeoutMs = 5000 } = opts;
 
@@ -103,35 +136,20 @@ export async function handler(args: Argument) {
 			throw new Error("url must be provided as argument or via FETCH_URL env var");
 		}
 
-		const parsedUrl = (() => {
-			try {
-				return new URL(url);
-			} catch {
-				throw new Error(`Invalid URL: ${url}`);
-			}
-		})();
-
-		if (parsedUrl.protocol !== "https:") {
-			throw new Error("Insecure protocol disallowed: HTTPS is required.");
+		const latestJsonUrl = await getLatestJsonUrl(url);
+		if (!latestJsonUrl) {
+			throw new Error("Failed to get latest JSON URL");
 		}
 
-		parsedUrl.searchParams.set("t", String(Date.now()));
-		const urlWithTs = parsedUrl.toString();
+		console.log(`  [url=${latestJsonUrl}] Fetching JSON...`);
 
-		console.log(`  [url=${url}] Fetching JSON...`);
-		const data = await fetchJson(urlWithTs, {
-			timeoutMs: 8000,
-		});
-		console.log(`  [url=${url}] Fetched data.`);
+		const data = await fetchJson(latestJsonUrl, { timeoutMs: 8000 });
 
-		// Extract data using info path if provided
 		let result = data;
 		if (args?.info) {
 			result = getByPath(data, args.info);
-			console.log(`  [url=${url}] Extracted path: ${args.info}`);
 		}
 
-		// Truncate arrays to MAX_ARRAY_ITEMS
 		const truncated = truncateArrays(result, MAX_ARRAY_ITEMS);
 
 		return {
@@ -139,7 +157,6 @@ export async function handler(args: Argument) {
 			result: truncated,
 		};
 	} catch (error) {
-		console.error("> handler failed:", error);
 		const message = error instanceof Error ? error.message : String(error);
 		return {
 			ok: false,
